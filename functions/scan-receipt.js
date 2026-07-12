@@ -1,500 +1,32 @@
-// _worker.js — single file Cloudflare Worker
-// Serves the Jay Cheque app AND handles receipt scanning via Claude API.
-// Set ANTHROPIC_API_KEY in Cloudflare Workers > Settings > Variables.
+// functions/scan-receipt.js
+// Cloudflare Pages Function — runs as a Worker on the edge.
+// Set ANTHROPIC_API_KEY in Cloudflare Pages > Settings > Environment Variables.
 
-const HTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>Jay Cheque</title>
-<meta name="apple-mobile-web-app-capable" content="yes" />
-<meta name="apple-mobile-web-app-title" content="Jay Cheque" />
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-<meta name="theme-color" content="#EFE9DC" />
-<style>
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    min-height: 100vh;
-    background: #EFE9DC;
-    font-family: system-ui, -apple-system, sans-serif;
-    color: #211C16;
-    padding: 24px 12px 60px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-  }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace; }
-  .label-eyebrow {
-    font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
-    color: #9C9388; font-weight: 700;
-  }
-  .ticket {
-    width: 100%; max-width: 420px; background: #FAF6EE;
-    box-shadow: 0 18px 40px -20px rgba(33,28,22,0.45), 0 2px 0 rgba(33,28,22,0.04);
-    position: relative; border-radius: 2px; overflow: hidden;
-  }
-  .zig-top, .zig-bottom {
-    height: 14px; width: 100%;
-    background: #EFE9DC;
-    -webkit-mask: repeating-linear-gradient(115deg, transparent 0 7px, #000 7px 14px);
-    mask: repeating-linear-gradient(115deg, transparent 0 7px, #000 7px 14px);
-  }
-  .zig-bottom { transform: rotate(180deg); }
-  .dashed-rule { border-top: 1.5px dashed #D8D0C0; margin: 14px 0; }
-  button { font-family: inherit; cursor: pointer; }
-  input { font-family: inherit; }
-  .chip-btn {
-    border: none; border-radius: 999px; width: 32px; height: 32px;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 13px; font-weight: 700; flex-shrink: 0;
-  }
-  .chip-btn:active { transform: scale(0.92); }
-  .stamp {
-    border: 2.5px solid currentColor; border-radius: 10px;
-    transform: rotate(-3deg); padding: 6px 14px; display: inline-block;
-    font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; font-size: 12px;
-  }
-  .modal-overlay {
-    position: fixed; inset: 0; background: rgba(33,28,22,0.55);
-    display: flex; align-items: center; justify-content: center;
-    padding: 16px; z-index: 60;
-  }
-  .modal-card { max-height: 85vh; overflow-y: auto; }
-  .row-between { display: flex; justify-content: space-between; align-items: center; }
-  .btn-dark {
-    background: #211C16; color: #FAF6EE; border: none; border-radius: 10px;
-    padding: 12px 0; font-weight: 700; font-size: 13px; letter-spacing: 0.03em;
-    text-transform: uppercase; width: 100%; cursor: pointer;
-  }
-  .btn-green {
-    background: #2E6B4F; color: #fff; border: none; border-radius: 10px;
-    padding: 13px 0; font-weight: 800; font-size: 14px; letter-spacing: 0.03em;
-    text-transform: uppercase; width: 100%; cursor: pointer;
-  }
-  .btn-disabled { background: #D8D0C0 !important; cursor: default !important; }
-  .text-input {
-    border: 1.5px solid #D8D0C0; border-radius: 8px; padding: 8px 12px;
-    font-size: 14px; outline: none; background: #fff;
-  }
-  .upload-btn-label {
-    display: inline-block; padding: 14px 22px; border-radius: 999px;
-    font-weight: 700; font-size: 14px; letter-spacing: 0.04em;
-    text-transform: uppercase; cursor: pointer; text-align: center;
-  }
-</style>
-</head>
-<body>
-  <div style="width:100%;max-width:420px;margin-bottom:18px;text-align:center;">
-    <div class="label-eyebrow">snap · split · settle</div>
-    <h1 style="font-size:28px;margin:6px 0 0;font-weight:800;letter-spacing:-0.01em;">Jay Cheque</h1>
-  </div>
+export async function onRequestPost(context) {
+  const apiKey = context.env.ANTHROPIC_API_KEY;
 
-  <div id="app"></div>
+  if (!apiKey) {
+    return new Response(
+      JSON.stringify({ error: "ANTHROPIC_API_KEY not set. Add it in Cloudflare Pages > Settings > Environment Variables." }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
 
-<script>
-const PALETTE = ["#B23A2E", "#2E6B4F", "#1F5C8B", "#8A5A2E", "#6B4E8C", "#A8762E"];
-
-const state = {
-  stage: "upload",
-  imgPreview: null,
-  errorMsg: "",
-  currency: "$",
-  items: [],
-  tax: 0,
-  service: 0,
-  discount: 0,
-  people: [],
-  newName: "",
-  showSummary: false,
-  viewingPersonId: null,
-};
-
-function uid() { return Math.random().toString(36).slice(2, 9); }
-
-function money(n, cur) {
-  if (n === null || n === undefined || isNaN(n)) return "—";
-  return \`\${cur || "$"}\${Number(n).toFixed(2)}\`;
-}
-
-function escHtml(str) {
-  return String(str ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-}
-
-function billSubtotal() {
-  return state.items.reduce((s, it) => s + (Number(it.price) || 0), 0);
-}
-
-function perPersonBreakdown() {
-  const sub = billSubtotal();
-  return state.people.map(person => {
-    let share = 0;
-    state.items.forEach(it => {
-      if (it.assigned.includes(person.id) && it.assigned.length > 0)
-        share += (Number(it.price) || 0) / it.assigned.length;
-    });
-    const ratio = sub > 0 ? share / sub : 0;
-    const taxShare    = (Number(state.tax)      || 0) * ratio;
-    const serviceShare= (Number(state.service)  || 0) * ratio;
-    const discountShare=(Number(state.discount) || 0) * ratio;
-    const total = share + taxShare + serviceShare - discountShare;
-    return { person, share, taxShare, serviceShare, discountShare, total };
-  });
-}
-
-// ---- file handling ----
-window.handleFile = function(input) {
-  const file = input.files && input.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = () => {
-    state.imgPreview = reader.result;
-    scanReceipt(reader.result, file.type);
-  };
-  reader.readAsDataURL(file);
-};
-
-async function scanReceipt(dataUrl, mimeType) {
-  state.stage = "scanning";
-  state.errorMsg = "";
-  render();
+  let body;
   try {
-    const base64 = dataUrl.split(",")[1];
-    const mt = ["image/jpeg","image/png","image/webp","image/gif"].includes(mimeType) ? mimeType : "image/jpeg";
-
-    const res = await fetch("/scan-receipt", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image: base64, mediaType: mt }),
-    });
-
-    const parsed = await res.json();
-    if (!res.ok) throw new Error(parsed.error || "Scan failed");
-
-    state.currency = parsed.currency || "$";
-    state.items = (parsed.items || []).map(it => ({
-      id: uid(), name: it.name || "Item",
-      qty: typeof it.qty === "number" ? it.qty : 1,
-      price: typeof it.price === "number" ? it.price : 0,
-      assigned: [],
-    }));
-    state.tax      = typeof parsed.tax      === "number" ? parsed.tax      : 0;
-    state.service  = typeof parsed.service  === "number" ? parsed.service  : 0;
-    state.discount = typeof parsed.discount === "number" ? parsed.discount : 0;
-    state.stage = "review";
-  } catch (err) {
-    console.error(err);
-    state.errorMsg = "Couldn't read that receipt clearly. You can add items by hand below instead.";
-    state.items = [];
-    state.stage = "review";
+    body = await context.request.json();
+  } catch {
+    return new Response(JSON.stringify({ error: "Invalid JSON body" }), { status: 400, headers: { "Content-Type": "application/json" } });
   }
-  render();
-}
 
-// ---- actions (exposed to inline handlers) ----
-window.addPerson = function() {
-  const name = state.newName.trim();
-  if (!name) return;
-  state.people.push({ id: uid(), name, color: PALETTE[state.people.length % PALETTE.length] });
-  state.newName = "";
-  render();
-};
-window.removePerson = function(id) {
-  state.people = state.people.filter(p => p.id !== id);
-  state.items.forEach(it => { it.assigned = it.assigned.filter(a => a !== id); });
-  render();
-};
-window.toggleAssign = function(itemId, personId) {
-  const it = state.items.find(i => i.id === itemId);
-  if (!it) return;
-  it.assigned = it.assigned.includes(personId)
-    ? it.assigned.filter(a => a !== personId)
-    : [...it.assigned, personId];
-  render();
-};
-window.updateItem = function(id, field, value) {
-  const it = state.items.find(i => i.id === id);
-  if (!it) return;
-  it[field] = (field === "price" || field === "qty") ? (parseFloat(value) || 0) : value;
-  // don't re-render on every keystroke for text fields to avoid focus loss
-  if (field === "price" || field === "qty") render();
-};
-window.removeItem = function(id) {
-  state.items = state.items.filter(i => i.id !== id);
-  render();
-};
-window.addBlankItem = function() {
-  state.items.push({ id: uid(), name: "", qty: 1, price: 0, assigned: [] });
-  render();
-};
-window.setCharge = function(field, value) {
-  state[field] = field === "currency" ? value : (parseFloat(value) || 0);
-};
-window.setNewName = function(v) { state.newName = v; };
-window.openSummary  = function() { state.showSummary = true;  render(); };
-window.closeSummary = function() { state.showSummary = false; render(); };
-window.openPerson   = function(id) { state.viewingPersonId = id;   render(); };
-window.closePerson  = function()   { state.viewingPersonId = null; render(); };
-window.resetAll = function() {
-  state.stage = "upload"; state.imgPreview = null; state.items = []; state.people = [];
-  state.tax = 0; state.service = 0; state.discount = 0; state.errorMsg = "";
-  state.showSummary = false; state.viewingPersonId = null;
-  render();
-};
-
-// ---- render ----
-function withFocusPreserved(fn) {
-  const active = document.activeElement;
-  const id = active && active.id;
-  const sel = active && "selectionStart" in active ? active.selectionStart : null;
-  fn();
-  if (id) {
-    const el = document.getElementById(id);
-    if (el) { el.focus(); if (sel !== null && "setSelectionRange" in el) { try { el.setSelectionRange(sel, sel); } catch(e){} } }
+  const { image, mediaType } = body;
+  if (!image) {
+    return new Response(JSON.stringify({ error: "Missing image data" }), { status: 400, headers: { "Content-Type": "application/json" } });
   }
-}
 
-function render() {
-  withFocusPreserved(() => { document.getElementById("app").innerHTML = buildApp(); });
-}
+  const mt = ["image/jpeg", "image/png", "image/webp", "image/gif", "image/heic", "image/heif"].includes(mediaType) ? mediaType : "image/jpeg";
 
-function buildApp() {
-  let h = "";
-  if (state.stage === "upload")   h += buildUpload();
-  if (state.stage === "scanning") h += buildScanning();
-  if (state.stage === "review")   h += buildReview();
-  if (state.showSummary)          h += buildSummaryModal();
-  if (state.viewingPersonId)      h += buildPersonModal();
-  return h;
-}
-
-function buildUpload() {
-  return \`
-    <div class="ticket" style="padding:40px 28px;text-align:center;">
-      <div style="font-size:48px;margin-bottom:14px;">🧾</div>
-      <p class="mono" style="font-size:14px;color:#5A5248;margin:0 0 28px;line-height:1.6;">
-        Take or upload a photo of the check.<br/>We'll read every item off it.
-      </p>
-      
-      <input id="receipt-any" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" onchange="handleFile(this)" style="display:none;" />
-      <div style="display:flex;flex-direction:column;gap:12px;align-items:center;">
-        
-        <label for="receipt-any" class="upload-btn-label btn-dark" style="width:240px;">📷 Take or Upload Photo</label><p style="font-size:12px;color:#C7BFAF;margin:4px 0 0;">iPhone: choose Camera or Photo Library</p>
-      </div>
-    </div>\`;
-}
-
-function buildScanning() {
-  return \`
-    <div class="ticket" style="padding:30px 28px;text-align:center;">
-      \${state.imgPreview ? \`<img src="\${state.imgPreview}" alt="receipt" style="width:100%;max-height:240px;object-fit:contain;margin-bottom:18px;border-radius:4px;" />\` : ""}
-      <div style="font-size:28px;margin-bottom:12px;">⏳</div>
-      <div class="mono" style="font-size:14px;color:#5A5248;">Reading your receipt…</div>
-    </div>\`;
-}
-
-function buildReview() {
-  const sub = billSubtotal();
-  const unassigned = state.items.filter(it => it.assigned.length === 0);
-  const canShowTotals = state.people.length > 0 && state.items.length > 0;
-
-  const peopleChips = state.people.map(p => \`
-    <div style="display:flex;align-items:center;gap:6px;background:#fff;border:1.5px solid \${p.color};border-radius:999px;padding:5px 8px 5px 12px;font-size:13px;font-weight:600;">
-      <button onclick="openPerson('\${p.id}')" style="background:none;border:none;color:\${p.color};font-weight:700;font-size:13px;padding:0;cursor:pointer;">\${escHtml(p.name)}</button>
-      <button onclick="removePerson('\${p.id}')" style="background:none;border:none;color:#C7BFAF;font-size:16px;line-height:1;padding:0 2px;cursor:pointer;">×</button>
-    </div>\`).join("");
-
-  const itemRows = state.items.map(it => {
-    const chips = state.people.length === 0
-      ? \`<span style="font-size:12px;color:#C7BFAF;">Add people above to assign</span>\`
-      : state.people.map(p => {
-          const active = it.assigned.includes(p.id);
-          return \`<button onclick="toggleAssign('\${it.id}','\${p.id}')" class="chip-btn" title="\${escHtml(p.name)}"
-            style="background:\${active ? p.color : "#fff"};border:1.5px solid \${p.color};color:\${active ? "#fff" : p.color};opacity:\${active ? 1 : 0.5};">
-            \${escHtml(p.name.slice(0,1).toUpperCase())}
-          </button>\`;
-        }).join("");
-    return \`
-      <div style="padding:12px 0;border-bottom:1px solid #EFE9DC;">
-        <div style="display:flex;align-items:center;gap:8px;">
-          <input id="iname-\${it.id}" value="\${escHtml(it.name)}" oninput="updateItem('\${it.id}','name',this.value)" placeholder="Item name"
-            class="mono" style="flex:1;border:none;background:transparent;font-size:14.5px;font-weight:600;padding:2px 0;outline:none;" />
-          <input id="iprice-\${it.id}" value="\${it.price}" oninput="updateItem('\${it.id}','price',this.value)" type="number" step="0.01"
-            class="mono" style="width:80px;text-align:right;border:none;background:transparent;font-size:14.5px;font-weight:700;outline:none;" />
-          <button onclick="removeItem('\${it.id}')" style="background:none;border:none;color:#D8D0C0;font-size:18px;padding:0 4px;line-height:1;">×</button>
-        </div>
-        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;">\${chips}</div>
-      </div>\`;
-  }).join("");
-
-  const chargeRow = (label, field, type) => \`
-    <div class="row-between" style="margin-bottom:10px;">
-      <span class="mono" style="font-size:13.5px;color:#5A5248;">\${label}</span>
-      <input id="charge-\${field}" value="\${escHtml(String(state[field]))}" oninput="setCharge('\${field}',this.value)" type="\${type}" step="0.01"
-        class="mono text-input" style="width:\${type==="text"?"60px":"96px"};text-align:right;padding:6px 8px;font-size:13.5px;" />
-    </div>\`;
-
-  return \`
-    <div class="ticket">
-      <div class="zig-top"></div>
-      <div style="padding:22px 24px 8px;">
-        \${state.errorMsg ? \`<div style="background:#FDEDEA;color:#B23A2E;font-size:13px;padding:10px 14px;border-radius:8px;margin-bottom:16px;line-height:1.5;">\${escHtml(state.errorMsg)}</div>\` : ""}
-        <div class="label-eyebrow" style="margin-bottom:4px;">Who's splitting?</div>
-        <p style="font-size:12px;color:#C7BFAF;margin:0 0 10px;">Tap a name to review their items</p>
-        <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;">\${peopleChips}</div>
-        <div style="display:flex;gap:8px;">
-          <input id="new-name-input" value="\${escHtml(state.newName)}" oninput="setNewName(this.value)"
-            onkeydown="if(event.key==='Enter'){addPerson();}" placeholder="Add a name…"
-            class="text-input" style="flex:1;" />
-          <button onclick="addPerson()" class="btn-dark" style="width:auto;padding:10px 18px;border-radius:8px;">Add</button>
-        </div>
-      </div>
-
-      <div class="dashed-rule" style="margin:16px 24px;"></div>
-
-      <div style="padding:0 24px 8px;">
-        <div class="label-eyebrow" style="margin-bottom:4px;">Tap names to assign each item</div>
-        \${state.items.length === 0 ? \`<p class="mono" style="font-size:13px;color:#9C9388;margin:10px 0;">No items yet — add some below.</p>\` : ""}
-        \${itemRows}
-        <button onclick="addBlankItem()" style="width:100%;margin-top:12px;background:none;border:1.5px dashed #D8D0C0;border-radius:8px;padding:11px 0;font-size:13px;font-weight:700;color:#9C9388;letter-spacing:0.03em;text-transform:uppercase;cursor:pointer;">+ Add Item</button>
-      </div>
-
-      <div class="dashed-rule" style="margin:16px 24px;"></div>
-
-      <div style="padding:0 24px 22px;">
-        <div class="label-eyebrow" style="margin-bottom:12px;">Receipt charges</div>
-        \${chargeRow("Currency", "currency", "text")}
-        \${chargeRow("Tax", "tax", "number")}
-        \${chargeRow("Service / Tip", "service", "number")}
-        \${chargeRow("Discount", "discount", "number")}
-        <div class="dashed-rule"></div>
-        <div class="row-between" style="font-weight:800;font-size:16px;margin-bottom:4px;">
-          <span>Subtotal</span><span class="mono">\${money(sub, state.currency)}</span>
-        </div>
-        \${unassigned.length > 0 ? \`<p style="font-size:12px;color:#B23A2E;margin:8px 0 0;line-height:1.5;">⚠️ \${unassigned.length} item\${unassigned.length>1?"s":""} not yet assigned: \${escHtml(unassigned.map(i=>i.name||"Untitled").join(", "))}</p>\` : ""}
-        <button onclick="\${canShowTotals ? "openSummary()" : ""}" class="\${canShowTotals ? "btn-green" : "btn-green btn-disabled"}" style="margin-top:18px;">Show Totals</button>
-      </div>
-      <div class="zig-bottom"></div>
-    </div>
-    <button onclick="resetAll()" style="margin-top:16px;background:none;border:none;color:#9C9388;font-size:13px;text-decoration:underline;">↩ Start over with a new photo</button>\`;
-}
-
-function buildSummaryModal() {
-  const rows = perPersonBreakdown();
-  const sub = billSubtotal();
-  const grand = sub + (Number(state.tax)||0) + (Number(state.service)||0) - (Number(state.discount)||0);
-
-  const rowsHtml = rows.map(({person, share, taxShare, serviceShare, discountShare, total}) => \`
-    <div style="margin-bottom:18px;">
-      <div class="row-between" style="margin-bottom:6px;">
-        <button onclick="openPerson('\${person.id}')" style="background:none;border:none;padding:0;font-weight:800;font-size:15px;color:\${person.color};cursor:pointer;">\${escHtml(person.name)}</button>
-        <span class="stamp" style="color:\${person.color};">\${money(total, state.currency)}</span>
-      </div>
-      <div class="mono" style="font-size:12.5px;color:#9C9388;line-height:1.7;">
-        <div class="row-between"><span>items</span><span>\${money(share, state.currency)}</span></div>
-        \${state.tax>0    ? \`<div class="row-between"><span>tax share</span><span>\${money(taxShare,state.currency)}</span></div>\` : ""}
-        \${state.service>0? \`<div class="row-between"><span>service share</span><span>\${money(serviceShare,state.currency)}</span></div>\` : ""}
-        \${state.discount>0?\`<div class="row-between"><span>discount share</span><span>−\${money(discountShare,state.currency)}</span></div>\` : ""}
-      </div>
-      <div class="dashed-rule" style="margin:12px 0 0;"></div>
-    </div>\`).join("");
-
-  return \`
-    <div class="modal-overlay" onclick="closeSummary()">
-      <div class="ticket modal-card" onclick="event.stopPropagation()">
-        <div class="zig-top"></div>
-        <div style="padding:24px 26px;">
-          <div class="label-eyebrow" style="text-align:center;margin-bottom:4px;">final tally</div>
-          <h2 style="text-align:center;font-size:20px;font-weight:800;margin:0 0 18px;">Who Owes What</h2>
-          \${rowsHtml}
-          <div class="row-between" style="font-weight:800;font-size:17px;margin-top:4px;">
-            <span>Total bill</span><span class="mono">\${money(grand, state.currency)}</span>
-          </div>
-          <button onclick="closeSummary()" class="btn-dark" style="margin-top:20px;">Back to Editing</button>
-        </div>
-        <div class="zig-bottom"></div>
-      </div>
-    </div>\`;
-}
-
-function buildPersonModal() {
-  const person = state.people.find(p => p.id === state.viewingPersonId);
-  if (!person) return "";
-  const row = perPersonBreakdown().find(r => r.person.id === state.viewingPersonId);
-
-  const itemsHtml = state.items.length === 0
-    ? \`<p class="mono" style="font-size:13px;color:#9C9388;">No items on this check yet.</p>\`
-    : state.items.map(it => {
-        const checked = it.assigned.includes(person.id);
-        const n = it.assigned.length;
-        const myShare = checked && n > 0 ? (Number(it.price)||0)/n : 0;
-        return \`
-          <label style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid #EFE9DC;cursor:pointer;">
-            <input type="checkbox" \${checked?"checked":""} onchange="toggleAssign('\${it.id}','\${person.id}')"
-              style="width:18px;height:18px;accent-color:\${person.color};flex-shrink:0;" />
-            <span class="mono" style="flex:1;font-size:14px;color:\${checked?"#211C16":"#9C9388"};font-weight:\${checked?600:400};">
-              \${escHtml(it.name||"Untitled")}\${n>1?\`<span style="color:#9C9388;font-weight:400;"> ÷\${n}</span>\`:""}
-            </span>
-            <span class="mono" style="font-size:13.5px;color:\${checked?"#211C16":"#C7BFAF"};">\${checked?money(myShare,state.currency):money(it.price,state.currency)}</span>
-          </label>\`;
-      }).join("");
-
-  return \`
-    <div class="modal-overlay" onclick="closePerson()">
-      <div class="ticket modal-card" onclick="event.stopPropagation()">
-        <div class="zig-top"></div>
-        <div style="padding:22px 24px;">
-          <div class="label-eyebrow" style="margin-bottom:4px;">breakdown</div>
-          <h2 style="font-size:19px;font-weight:800;margin:0 0 16px;color:\${person.color};">\${escHtml(person.name)}'s Items</h2>
-          \${itemsHtml}
-          <div class="dashed-rule"></div>
-          \${row ? \`
-          <div class="mono" style="font-size:13px;color:#5A5248;line-height:1.8;">
-            <div class="row-between"><span>items</span><span>\${money(row.share,state.currency)}</span></div>
-            \${state.tax>0     ? \`<div class="row-between"><span>tax share</span><span>\${money(row.taxShare,state.currency)}</span></div>\`:""}
-            \${state.service>0 ? \`<div class="row-between"><span>service share</span><span>\${money(row.serviceShare,state.currency)}</span></div>\`:""}
-            \${state.discount>0? \`<div class="row-between"><span>discount share</span><span>−\${money(row.discountShare,state.currency)}</span></div>\`:""}
-          </div>\` : ""}
-          <div class="row-between" style="margin-top:14px;">
-            <span style="font-weight:800;font-size:15px;">Total</span>
-            <span class="stamp" style="color:\${person.color};">\${money(row?row.total:0, state.currency)}</span>
-          </div>
-          <button onclick="closePerson()" class="btn-dark" style="margin-top:20px;">Done</button>
-        </div>
-        <div class="zig-bottom"></div>
-      </div>
-    </div>\`;
-}
-
-render();
-</script>
-</body>
-</html>
-`;
-
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-
-    // ── POST /scan-receipt — call Claude to read the receipt image ──
-    if (request.method === "POST" && url.pathname === "/scan-receipt") {
-      const apiKey = env.ANTHROPIC_API_KEY;
-      if (!apiKey) {
-        return json({ error: "ANTHROPIC_API_KEY not set in Worker environment variables." }, 500);
-      }
-
-      let body;
-      try { body = await request.json(); }
-      catch { return json({ error: "Invalid JSON body" }, 400); }
-
-      const { image, mediaType } = body;
-      if (!image) return json({ error: "Missing image data" }, 400);
-
-      const mt = ["image/jpeg","image/png","image/webp","image/gif","image/heic","image/heif"].includes(mediaType)
-        ? mediaType : "image/jpeg";
-
-      const prompt = `You are reading a photo of a restaurant or café receipt/check/فاتورة. The receipt may be in Arabic, English, or a mix of both. Arabic numerals (٠١٢٣٤٥٦٧٨٩) should be converted to Western numerals (0123456789).
+  const prompt = `You are reading a photo of a restaurant or café receipt/check/فاتورة. The receipt may be in Arabic, English, or a mix of both. Arabic numerals (٠١٢٣٤٥٦٧٨٩) should be converted to Western numerals (0123456789).
 
 Extract every distinct line item with its name, quantity, and the LINE TOTAL price (the total for that line as printed). Keep item names in their original language (Arabic or English) exactly as printed. Also extract the subtotal, tax (ضريبة/VAT), service charge (خدمة), discount (خصم), grand total, and the currency symbol or code used (e.g. ج.م or EGP for Egyptian Pound, ر.س or SAR for Saudi Riyal, د.إ or AED for UAE Dirham, etc.).
 
@@ -508,54 +40,53 @@ Respond with ONLY valid JSON and nothing else — no markdown fences, no comment
   "discount": number or null,
   "total": number or null
 }
-All numeric fields must be plain Western numerals. If a field is not present on the receipt, use null.`;
+All numeric fields must be plain Western numerals (not Arabic-Indic). If a field is not present on the receipt, use null.`;
 
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": apiKey,
-          "anthropic-version": "2023-06-01",
+  const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1000,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: mt, data: image } },
+            { type: "text", text: prompt },
+          ],
         },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-6",
-          max_tokens: 1000,
-          messages: [{
-            role: "user",
-            content: [
-              { type: "image", source: { type: "base64", media_type: mt, data: image } },
-              { type: "text", text: prompt },
-            ],
-          }],
-        }),
-      });
-
-      const data = await res.json();
-      if (!res.ok) return json({ error: data.error?.message || "Anthropic API error" }, res.status);
-
-      const textBlock = (data.content || []).find(c => c.type === "text");
-      if (!textBlock) return json({ error: "No text returned from Claude" }, 502);
-
-      let clean = textBlock.text.trim()
-        .replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "");
-
-      try {
-        return json(JSON.parse(clean), 200);
-      } catch {
-        return json({ error: "Could not parse Claude response" }, 502);
-      }
-    }
-
-    // ── GET / — serve the app ──
-    return new Response(HTML, {
-      headers: { "Content-Type": "text/html;charset=UTF-8" },
-    });
-  },
-};
-
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "Content-Type": "application/json" },
+      ],
+    }),
   });
+
+  const data = await anthropicRes.json();
+
+  if (!anthropicRes.ok) {
+    return new Response(
+      JSON.stringify({ error: data.error?.message || "Anthropic API error" }),
+      { status: anthropicRes.status, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  const textBlock = (data.content || []).find((c) => c.type === "text");
+  if (!textBlock) {
+    return new Response(JSON.stringify({ error: "No text returned from Claude" }), { status: 502, headers: { "Content-Type": "application/json" } });
+  }
+
+  let clean = textBlock.text.trim()
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/```\s*$/i, "");
+
+  try {
+    const result = JSON.parse(clean);
+    return new Response(JSON.stringify(result), { status: 200, headers: { "Content-Type": "application/json" } });
+  } catch {
+    return new Response(JSON.stringify({ error: "Could not parse Claude response" }), { status: 502, headers: { "Content-Type": "application/json" } });
+  }
 }
