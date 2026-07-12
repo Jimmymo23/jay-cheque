@@ -272,11 +272,11 @@ function buildUpload() {
       <p class="mono" style="font-size:14px;color:#5A5248;margin:0 0 28px;line-height:1.6;">
         Take or upload a photo of the check.<br/>We'll read every item off it.
       </p>
-      <input id="receipt-camera"  type="file" accept="image/*" capture="environment" onchange="handleFile(this)" style="display:none;" />
-      <input id="receipt-gallery" type="file" accept="image/*"                       onchange="handleFile(this)" style="display:none;" />
+      
+      <input id="receipt-any" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" onchange="handleFile(this)" style="display:none;" />
       <div style="display:flex;flex-direction:column;gap:12px;align-items:center;">
-        <label for="receipt-camera"  class="upload-btn-label btn-dark"  style="width:220px;">📷 Take Photo</label>
-        <label for="receipt-gallery" class="upload-btn-label" style="width:220px;background:#fff;color:#211C16;border:2px solid #211C16;">🖼 Choose from Gallery</label>
+        
+        <label for="receipt-any" class="upload-btn-label btn-dark" style="width:240px;">📷 Take or Upload Photo</label><p style="font-size:12px;color:#C7BFAF;margin:4px 0 0;">iPhone: choose Camera or Photo Library</p>
       </div>
     </div>`;
 }
